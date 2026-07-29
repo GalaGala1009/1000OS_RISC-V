@@ -2,9 +2,10 @@ ENTRY(boot) /*entry point*/
 
 SECTIONS {
     . = 0x80200000; /*start memory address*/
+    __kernel_base = .; /* new */
 
     /*machine code*/
-    .text :{
+    .text : {
 	KEEP(*(.text.boot));
 	*(.text .text.*);
     }

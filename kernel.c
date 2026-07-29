@@ -9,6 +9,10 @@ extern char __bss[], __bss_end[], __stack_top[];  // Declare symbol
 
 extern char __free_ram[], __free_ram_end[];       
 
+extern char __kernel_base[]; // new
+
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags);
+
 paddr_t alloc_pages(uint32_t n) {
     static paddr_t next_paddr = (paddr_t) __free_ram;
     paddr_t paddr = next_paddr;
@@ -176,7 +180,7 @@ struct process *create_process(uint32_t pc) {
 
     // Stack callee-saved registers. These register values will be restored in
     // the first context switch in switch_context.
-    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)]; // stack 在 RISC-V 上通常往低位址成長，所以這行把 sp 指到 stack 的最頂端
     *--sp = 0;                      // s11
     *--sp = 0;                      // s10
     *--sp = 0;                      // s9
@@ -191,10 +195,19 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s0
     *--sp = (uint32_t) pc;          // ra
 
+    /*-----new-----*/
+    // Map kernel pages.
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+
+
     // Initialize fields.
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+    proc->page_table = page_table; // new
     return proc;
 }
 
@@ -256,16 +269,45 @@ void yield(void) {
     if (next == current_proc)
         return;
 
+    struct process *prev = current_proc;
+    current_proc = next;
+
+    // 在切換到下一個 process 前，把 next process 的 kernel stack 頂端位址寫入 RISC-V 的 sscratch CSR
     __asm__ __volatile__(
+        "sfence.vma\n"            // new
+        "csrw satp, %[satp]\n"    // new
+        "sfence.vma\n"            // new
         "csrw sscratch, %[sscratch]\n"
         :
-        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+        // Don't forget the trailing comma!
+        // 除以 PAGE_SIZE，因為這裡指的是實體頁號（physical page number）
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)), // new
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
 
     // Context switch
-    struct process *prev = current_proc;
-    current_proc = next;
     switch_context(&prev->sp, &next->sp);
+}
+
+// Maping Page
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        // Create the 2nd level page table if it doesn't exist.
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    // Set the 2nd level page table entry to map the physical page.
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
 }
 
 
@@ -318,5 +360,4 @@ void kernel_main(void) {
     yield();
     PANIC("switched to idle process");
 }
-
 
